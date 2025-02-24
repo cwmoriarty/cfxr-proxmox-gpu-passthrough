@@ -221,8 +221,6 @@ gcc vbios.c -o vbios
 rm vbios.c -q
 mv vbios_*.bin /usr/share/kvm/vbios-custom.bin
 echo " Use ',romfile=vbios-custom.bin' in your VM."
-
-    fi
     elif [ $option -eq 5 ]; then
         sed -i 's/ iommu=pt//' /etc/default/grub
         sed -i 's/ intel_iommu=on//' /etc/default/grub
