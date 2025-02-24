@@ -218,7 +218,7 @@ int main(int argc, char** argv)
 EOF
 gcc vbios.c -o vbios
 ./vbios
-rm vbios.c -q
+rm vbios.c -f
 mv vbios_*.bin /usr/share/kvm/vbios-custom.bin
 echo " Use ',romfile=vbios-custom.bin' in your VM."
     elif [ $option -eq 5 ]; then
