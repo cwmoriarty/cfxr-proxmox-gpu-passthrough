@@ -36,14 +36,17 @@ elif [ $option -eq 2 ]; then
     echo vfio_iommu_type1 >> /etc/modules
     echo vfio_pci >> /etc/modules
 
-    device_id=$(lspci -nn | grep -Ei "vga|3d" | grep -i nvidia | sed -n 's/.*\[\([0-9a-fA-F:]*\)\].*/\1/p')
-    if [ "$device_id" ]; then
-        echo "options vfio-pci ids=$device_id" >> /etc/modprobe.d/vfio.conf
+    device_ids=$(lspci -nn | grep -i -e 'nvidia' -e 'AMD/ATI'| sed -n 's/.*\[\([0-9a-fA-F:]*\)\].*/\1/p'|sed 'N;s/\n/,/')
+    if [ "$device_ids" ]; then
+        echo "options vfio-pci ids=$device_ids" >> /etc/modprobe.d/vfio.conf
         echo "softdep nouveau pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
         echo "softdep nvidia pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
         echo "softdep nvidiafb pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
         echo "softdep nvidia_drm pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
         echo "softdep drm pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
+        echo "softdep radeon pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
+        echo "softdep amdgpu pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
+        echo "softdep snd_hda_intel pre: vfio-pci" >> /etc/modprobe.d/vfio.conf
     fi
 
     /usr/sbin/update-initramfs -u
@@ -51,7 +54,7 @@ elif [ $option -eq 2 ]; then
     echo Please reboot for GPU passthrough to take effect.
     
 elif [ $option -eq 3 ]; then
-    if lspci -nnk | grep -A1 NVIDIA | grep -q vfio-pci; then
+    if lspci -nnk | grep -A1 -e NVIDIA -e 'AMD/ATI'| grep -q vfio-pci; then
         echo GPU passthrough successfully enabled!
     else
         echo ERROR: vfio driver is not bound to the GPU device
@@ -67,15 +70,21 @@ elif [ $option -eq 4 ]; then
     sed -i '/vfio_iommu_type1/d' /etc/modules
     sed -i '/vfio_pci/d' /etc/modules
 
-    device_id=$(lspci -nn | grep NVIDIA | cut -f10 -d' ' | tr -d [ | tr -d ])
-    if [ "$device_id" ]; then
-        sed -i "/options vfio-pci ids=$device_id/d" /etc/modprobe.d/vfio.conf
+    device_ids=$(lspci -nn | grep -i -e 'nvidia' -e 'AMD/ATI'| sed -n 's/.*\[\([0-9a-fA-F:]*\)\].*/\1/p'|sed 'N;s/\n/,/')
+    if [ "$device_ids" ]; then
+        sed -i "/options vfio-pci ids=$device_ids/d" /etc/modprobe.d/vfio.conf
         sed -i '/softdep nouveau pre: vfio-pci/d' /etc/modprobe.d/vfio.conf
         sed -i '/softdep nvidia pre: vfio-pci/d' /etc/modprobe.d/vfio.conf
         sed -i '/softdep nvidiafb pre: vfio-pci/d' /etc/modprobe.d/vfio.conf
         sed -i '/softdep nvidia_drm pre: vfio-pci/d' /etc/modprobe.d/vfio.conf
         sed -i '/softdep drm pre: vfio-pci/d' /etc/modprobe.d/vfio.conf
+        sed -i '/softdep radeon pre: vfio-pci' /etc/modprobe.d/vfio.conf
+        sed -i '/softdep amdgpu pre: vfio-pci' /etc/modprobe.d/vfio.conf
+        sed -i '/softdep snd_hda_intel pre: vfio-pci' /etc/modprobe.d/vfio.conf
     fi
 
     /usr/sbin/update-initramfs -u
+
+    echo Please reboot to revert changes.
+
 fi
