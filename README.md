@@ -20,6 +20,10 @@ This option will check if the appropriate CPU virtualization and IOMMU features 
 This option will make the necessary changes to allow Proxmox to passthrough a GPU device to a VM.
 Once passthrough is enabled and assigned to a VM, the GPU device cannot be shared between the VM and host or other VMs.
 
+> [!WARNING]
+> This script binds the GPU to `vfio-pci` for dedicated VM passthrough. Do **not** use this if you intend to share the GPU with LXC containers (e.g., running Ollama), as VFIO unbinds the host driver and disables container access to `/dev/dri` and `/dev/kfd`.
+
+
 ## Verify GPU passthrough
 This option will verify that the VFIO driver is properly bound to the GPU device. If it isn't, it will return an error message.
 Note: this option assumes that you have added the GPU device to a VM. If you have not, then it may return an error.
