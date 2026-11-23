@@ -13,6 +13,7 @@ VFIO_CONF="/etc/modprobe.d/vfio.conf"
 GRUB_CONF="/etc/default/grub"
 KERNEL_CMDLINE="/etc/kernel/cmdline"
 MODULES_CONF="/etc/modules"
+BACKUP_DIR="/var/backups/cfxr-proxmox-gpu-passthrough"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -52,8 +53,11 @@ confirm() {
 backup_file() {
     local f="$1"
     if [[ -f "$f" ]]; then
-        local backup="${f}.bak.$(date +%Y%m%d%H%M%S)"
-        cp "$f" "$backup"
+        mkdir -p "$BACKUP_DIR"
+        local safe_name
+        safe_name=$(basename "$f")
+        local backup="${BACKUP_DIR}/${safe_name}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -p "$f" "$backup"
         info "Backed up $f -> $backup"
     fi
 }
@@ -66,15 +70,29 @@ ensure_vfio_conf() {
 
 # --- Detect whether Proxmox uses systemd-boot (/etc/kernel/cmdline) or GRUB ---
 is_systemd_boot() {
-    [[ -f "$KERNEL_CMDLINE" ]] && command -v proxmox-boot-tool &>/dev/null && [[ -d /etc/kernel/pve-efiboot-uuids || -f /etc/kernel/proxmox-boot-uuids ]]
+    [[ -f "$KERNEL_CMDLINE" ]] \
+        && command -v proxmox-boot-tool &>/dev/null \
+        && [[ -s /etc/kernel/proxmox-boot-uuids || -s /etc/kernel/pve-efiboot-uuids ]]
 }
 
 # --- Idempotent helpers for kernel cmdline iommu params ---
+cmdline_has_param() {
+    local text="$1"
+    local param="$2"
+    echo "$text" | grep -qE "(^|[[:space:]\"])${param}([[:space:]\"]|$)"
+}
+
 cmdline_add_param() {
     local param="$1"
     if is_systemd_boot; then
-        if ! grep -qw "$param" "$KERNEL_CMDLINE"; then
-            sed -i "1s/[[:space:]]*$/ ${param}/; 1s/^[[:space:]]*//" "$KERNEL_CMDLINE"
+        local current=""
+        [[ -s "$KERNEL_CMDLINE" ]] && current=$(cat "$KERNEL_CMDLINE")
+        if ! cmdline_has_param "$current" "$param"; then
+            if [[ ! -s "$KERNEL_CMDLINE" ]]; then
+                echo "$param" > "$KERNEL_CMDLINE"
+            else
+                sed -i "1s/[[:space:]]*$/ ${param}/; 1s/^[[:space:]]*//" "$KERNEL_CMDLINE"
+            fi
             info "Added '$param' to $KERNEL_CMDLINE."
         else
             warn "'$param' already present in $KERNEL_CMDLINE."
@@ -85,7 +103,7 @@ cmdline_add_param() {
     local line
     line=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_CONF" || true)
     if [[ -n "$line" ]]; then
-        if ! echo "$line" | grep -qw "$param"; then
+        if ! cmdline_has_param "$line" "$param"; then
             # Append param inside quotes, avoiding a leading space if empty
             if echo "$line" | grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=""'; then
                 sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${param}\"/" "$GRUB_CONF"
@@ -105,7 +123,9 @@ cmdline_add_param() {
 cmdline_remove_param() {
     local param="$1"
     if is_systemd_boot; then
-        if grep -qw "$param" "$KERNEL_CMDLINE"; then
+        local current=""
+        [[ -s "$KERNEL_CMDLINE" ]] && current=$(cat "$KERNEL_CMDLINE")
+        if cmdline_has_param "$current" "$param"; then
             sed -i -E "s/(^|[[:space:]])${param}([[:space:]]|$)/\1/g; s/^[[:space:]]+//; s/[[:space:]]+$//" "$KERNEL_CMDLINE"
             info "Removed '$param' from $KERNEL_CMDLINE."
         fi
@@ -114,8 +134,8 @@ cmdline_remove_param() {
 
     local line
     line=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_CONF" || true)
-    if [[ -n "$line" ]] && echo "$line" | grep -qw "$param"; then
-        sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/ { s/\"${param} /\"/; s/ ${param}\"/\"/; s/\"${param}\"/\"\"/; s/ ${param} / /g; }" "$GRUB_CONF"
+    if [[ -n "$line" ]] && cmdline_has_param "$line" "$param"; then
+        sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/ { s/\"${param}[[:space:]]+/\"/; s/[[:space:]]+${param}\"/\"/; s/\"${param}\"/\"\"/; s/[[:space:]]+${param}[[:space:]]+/ /g; }" "$GRUB_CONF"
         info "Removed '$param' from GRUB cmdline."
     fi
 }
@@ -135,6 +155,7 @@ update_bootloader() {
 # --- Idempotent helpers for /etc/modules ---
 add_module() {
     local mod="$1"
+    [[ -f "$MODULES_CONF" ]] || touch "$MODULES_CONF"
     if ! grep -qx "$mod" "$MODULES_CONF"; then
         echo "$mod" >> "$MODULES_CONF"
     fi
@@ -142,7 +163,9 @@ add_module() {
 
 remove_module() {
     local mod="$1"
-    sed -i "/^${mod}$/d" "$MODULES_CONF"
+    if [[ -f "$MODULES_CONF" ]]; then
+        sed -i "/^${mod}$/d" "$MODULES_CONF"
+    fi
 }
 
 # --- Idempotent helpers for softdep lines ---
@@ -169,32 +192,36 @@ remove_softdep() {
 check_virtualization() {
     header "Checking CPU Virtualization & IOMMU"
 
-    require_cmd lscpu dmesg || return
+    require_cmd lscpu || return
 
     local virt_type
     virt_type=$(lscpu | grep -i virtualization || true)
 
-    if [[ "$virt_type" == *'VT-x'* ]]; then
+    if [[ "$virt_type" == *'VT-x'* ]] || grep -qw 'vmx' /proc/cpuinfo 2>/dev/null; then
         info "Intel VT-x virtualization is enabled."
-    elif [[ "$virt_type" == *'AMD-V'* ]]; then
+    elif [[ "$virt_type" == *'AMD-V'* ]] || grep -qw 'svm' /proc/cpuinfo 2>/dev/null; then
         info "AMD-V virtualization is enabled."
     else
         error "CPU virtualization is not enabled. Check BIOS/UEFI settings."
     fi
 
-    # Check IOMMU - support multiple dmesg indicators
-    if dmesg 2>/dev/null | grep -qE "DMAR-IR: Enabled IRQ remapping|AMD-Vi: Interrupt remapping enabled|IOMMU enabled|DMAR:.*IOMMU enabled"; then
-        info "IOMMU/interrupt remapping is enabled."
+    # Check IOMMU via sysfs (works without root) and dmesg (requires root when dmesg_restrict=1)
+    if dmesg >/dev/null 2>&1; then
+        if dmesg | grep -qE "DMAR-IR: Enabled IRQ remapping|AMD-Vi: Interrupt remapping enabled|IOMMU enabled|DMAR:.*IOMMU enabled"; then
+            info "IOMMU/interrupt remapping is enabled."
+        else
+            warn "IOMMU remapping not detected in dmesg."
+            warn "Check BIOS: enable VT-d (Intel) or AMD-Vi / IOMMU (AMD)."
+            warn "If you just enabled it, you may need to reboot first."
+        fi
     else
-        warn "IOMMU remapping not detected in dmesg."
-        warn "Check BIOS: enable VT-d (Intel) or AMD-Vi / IOMMU (AMD)."
-        warn "If you just enabled it, you may need to reboot first."
+        warn "Cannot read dmesg (run as root to check interrupt remapping in kernel logs)."
     fi
 
     # Show IOMMU groups if available
     if [[ -d /sys/kernel/iommu_groups ]]; then
         local group_count
-        group_count=$(find /sys/kernel/iommu_groups -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+        group_count=$(find /sys/kernel/iommu_groups -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$group_count" -gt 0 ]]; then
             info "Found $group_count IOMMU groups."
         else
@@ -212,6 +239,23 @@ enable_passthrough() {
     require_root
     require_cmd lscpu lspci sed update-initramfs || return
 
+    local lspci_output gpu_lines device_ids
+    lspci_output=$(lspci -nn)
+    gpu_lines=$(echo "$lspci_output" | grep -Ei "vga|3d|display|audio" | grep -i -e 'nvidia' -e 'AMD/ATI' || true)
+    device_ids=$(echo "$gpu_lines" \
+        | sed -n 's/.*\[\([0-9a-fA-F]\{4\}:[0-9a-fA-F]\{4\}\)\].*/\1/p' \
+        | sort -u \
+        | paste -sd ',' -)
+
+    if [[ -n "$device_ids" ]]; then
+        info "Detected GPU/audio PCI devices (IDs: $device_ids):"
+        echo
+        echo "$gpu_lines"
+        echo
+    else
+        warn "No NVIDIA or AMD/ATI GPUs detected."
+    fi
+
     if ! confirm "This will modify bootloader, kernel modules, and modprobe configs. Continue?"; then
         warn "Aborted."
         return
@@ -227,13 +271,16 @@ enable_passthrough() {
     local cpu_info
     cpu_info=$(lscpu)
     if echo "$cpu_info" | grep -qi Intel; then
-        cmdline_add_param "intel_iommu=on"
+        cmdline_add_param "intel_iommu=on" || return 1
     elif echo "$cpu_info" | grep -qi AMD; then
-        cmdline_add_param "amd_iommu=on"
+        cmdline_add_param "amd_iommu=on" || return 1
     fi
-    cmdline_add_param "iommu=pt"
+    cmdline_add_param "iommu=pt" || return 1
 
-    update_bootloader
+    if ! update_bootloader; then
+        error "Bootloader update failed."
+        return 1
+    fi
 
     # --- Kernel modules ---
     backup_file "$MODULES_CONF"
@@ -248,33 +295,15 @@ enable_passthrough() {
     fi
     info "VFIO kernel modules configured in $MODULES_CONF."
 
-    # --- Detect GPU PCI IDs ---
+    # --- Configure VFIO PCI IDs & softdeps ---
     backup_file "$VFIO_CONF"
     ensure_vfio_conf
 
-    local lspci_output
-    lspci_output=$(lspci -nn)
-
-    local gpu_lines
-    gpu_lines=$(echo "$lspci_output" | grep -Ei "vga|3d|display|audio" | grep -i -e 'nvidia' -e 'AMD/ATI' || true)
-
-    local device_ids
-    device_ids=$(echo "$gpu_lines" \
-        | sed -n 's/.*\[\([0-9a-fA-F]\{4\}:[0-9a-fA-F]\{4\}\)\].*/\1/p' \
-        | sort -u \
-        | paste -sd ',' -)
-
     if [[ -n "$device_ids" ]]; then
-        info "Found GPU PCI IDs: $device_ids"
-        echo
-        echo "$gpu_lines"
-        echo
-
         # Set VFIO PCI IDs (idempotent)
         sed -i "/^options vfio-pci ids=/d" "$VFIO_CONF"
         echo "options vfio-pci ids=${device_ids}" >> "$VFIO_CONF"
     else
-        warn "No NVIDIA or AMD/ATI GPUs detected."
         warn "You may need to manually add PCI IDs to $VFIO_CONF."
     fi
 
@@ -298,7 +327,10 @@ enable_passthrough() {
 
     # --- Update initramfs ---
     info "Updating initramfs..."
-    update-initramfs -u
+    if ! update-initramfs -u; then
+        error "initramfs update failed."
+        return 1
+    fi
 
     echo
     info "Configuration complete. Review $VFIO_CONF:"
@@ -315,20 +347,33 @@ enable_passthrough() {
 verify_passthrough() {
     header "Verifying GPU Passthrough"
 
-    require_cmd lspci || return
+    require_cmd lspci awk || return
 
     local gpu_bindings
-    gpu_bindings=$(lspci -nnk 2>/dev/null | grep -A3 -Ei 'NVIDIA|AMD/ATI' || true)
+    gpu_bindings=$(lspci -nnk 2>/dev/null | awk '
+        /^[^[:space:]]/ { match_dev = (tolower($0) ~ /(vga|3d|display|audio)/ && tolower($0) ~ /(nvidia|amd\/ati)/) }
+        match_dev { print }
+    ')
 
     if [[ -z "$gpu_bindings" ]]; then
         warn "No NVIDIA or AMD/ATI GPUs found in lspci output."
         return
     fi
 
-    if echo "$gpu_bindings" | grep -q 'vfio-pci'; then
-        info "GPU passthrough is active — vfio-pci driver is bound:"
+    local total_devs bound_devs
+    total_devs=$(echo "$gpu_bindings" | grep -cE '^[^[:space:]]' || true)
+    bound_devs=$(echo "$gpu_bindings" | grep -cE 'Kernel driver in use: vfio-pci' || true)
+
+    if [[ "$total_devs" -gt 0 && "$bound_devs" -eq "$total_devs" ]]; then
+        info "GPU passthrough is active — all $total_devs GPU/audio function(s) bound to vfio-pci:"
         echo
         echo "$gpu_bindings"
+    elif [[ "$bound_devs" -gt 0 ]]; then
+        warn "Partial passthrough — $bound_devs of $total_devs GPU/audio function(s) bound to vfio-pci:"
+        echo
+        echo "$gpu_bindings"
+        echo
+        warn "Check $VFIO_CONF and reboot if changes were just applied."
     else
         error "vfio-pci driver is NOT bound to the GPU(s)."
         echo
@@ -415,61 +460,88 @@ typedef struct {
 
 int main(int argc, char** argv)
 {
+    (void)argc;
     FILE* fp_vfct;
     FILE* fp_vbios;
     UEFI_ACPI_VFCT* pvfct;
     char vbios_name[0x400];
 
-    if (!(fp_vfct = fopen("/sys/firmware/acpi/tables/VFCT", "r"))) {
+    if (!(fp_vfct = fopen("/sys/firmware/acpi/tables/VFCT", "rb"))) {
         perror(argv[0]);
         return -1;
     }
     if (!(pvfct = malloc(sizeof(UEFI_ACPI_VFCT)))) {
         perror(argv[0]);
+        fclose(fp_vfct);
         return -1;
     }
     if (sizeof(UEFI_ACPI_VFCT) != fread(pvfct, 1, sizeof(UEFI_ACPI_VFCT), fp_vfct)) {
         fprintf(stderr, "%s: failed to read VFCT header!\n", argv[0]);
+        free(pvfct);
+        fclose(fp_vfct);
         return -1;
     }
 
     ULONG offset = pvfct->VBIOSImageOffset;
     ULONG tbl_size = pvfct->SHeader.TableLength;
 
-    if (!(pvfct = realloc(pvfct, tbl_size))) {
-        perror(argv[0]);
+    if (tbl_size < sizeof(UEFI_ACPI_VFCT) || offset < sizeof(UEFI_ACPI_VFCT) || offset > tbl_size) {
+        fprintf(stderr, "%s: invalid VFCT table header (size=%u, offset=%u)\n", argv[0], tbl_size, offset);
+        free(pvfct);
+        fclose(fp_vfct);
         return -1;
     }
+
+    UEFI_ACPI_VFCT* resized = realloc(pvfct, tbl_size);
+    if (!resized) {
+        perror(argv[0]);
+        free(pvfct);
+        fclose(fp_vfct);
+        return -1;
+    }
+    pvfct = resized;
+
     if (tbl_size - sizeof(UEFI_ACPI_VFCT) != fread(pvfct + 1, 1, tbl_size - sizeof(UEFI_ACPI_VFCT), fp_vfct)) {
         fprintf(stderr, "%s: failed to read VFCT body!\n", argv[0]);
+        free(pvfct);
+        fclose(fp_vfct);
         return -1;
     }
     fclose(fp_vfct);
 
-    while (offset < tbl_size) {
+    while (tbl_size - offset >= sizeof(VFCT_IMAGE_HEADER)) {
         GOP_VBIOS_CONTENT* vbios = (GOP_VBIOS_CONTENT*)((char*)pvfct + offset);
         VFCT_IMAGE_HEADER* vhdr = &vbios->VbiosHeader;
 
         if (!vhdr->ImageLength)
             break;
 
+        if (vhdr->ImageLength > tbl_size - offset - sizeof(VFCT_IMAGE_HEADER)) {
+            fprintf(stderr, "%s: truncated vbios image in VFCT table!\n", argv[0]);
+            free(pvfct);
+            return -1;
+        }
+
         snprintf(vbios_name, sizeof(vbios_name), "vbios_%x_%x.bin", vhdr->VendorID, vhdr->DeviceID);
 
         if (!(fp_vbios = fopen(vbios_name, "wb"))) {
             perror(argv[0]);
+            free(pvfct);
             return -1;
         }
         if (vhdr->ImageLength != fwrite(&vbios->VbiosContent, 1, vhdr->ImageLength, fp_vbios)) {
             fprintf(stderr, "%s: failed to dump vbios %x:%x\n", argv[0], vhdr->VendorID, vhdr->DeviceID);
+            fclose(fp_vbios);
+            free(pvfct);
             return -1;
         }
         fclose(fp_vbios);
 
         printf("Dumped vbios %x:%x -> %s\n", vhdr->VendorID, vhdr->DeviceID, vbios_name);
 
-        offset += sizeof(VFCT_IMAGE_HEADER);
-        offset += vhdr->ImageLength;
+        offset += sizeof(VFCT_IMAGE_HEADER) + vhdr->ImageLength;
     }
+    free(pvfct);
     return 0;
 }
 VBIOS_EOF
@@ -478,18 +550,15 @@ VBIOS_EOF
     if ! gcc "${tmpdir}/vbios.c" -o "${tmpdir}/vbios"; then
         error "Compilation failed."
         rm -rf "$tmpdir"
-        return
+        return 1
     fi
 
     info "Extracting VBIOS ROM(s)..."
-    pushd "$tmpdir" > /dev/null
-    if ! ./vbios; then
+    if ! (cd "$tmpdir" && ./vbios); then
         error "VBIOS extraction failed."
-        popd > /dev/null
         rm -rf "$tmpdir"
-        return
+        return 1
     fi
-    popd > /dev/null
 
     # Install each extracted VBIOS
     mkdir -p /usr/share/kvm
@@ -542,7 +611,10 @@ revert_changes() {
     cmdline_remove_param "intel_iommu=on"
     cmdline_remove_param "amd_iommu=on"
 
-    update_bootloader
+    if ! update_bootloader; then
+        error "Bootloader update failed."
+        return 1
+    fi
 
     # --- Revert kernel modules ---
     backup_file "$MODULES_CONF"
@@ -572,7 +644,10 @@ revert_changes() {
 
     # --- Update initramfs ---
     info "Updating initramfs..."
-    update-initramfs -u
+    if ! update-initramfs -u; then
+        error "initramfs update failed."
+        return 1
+    fi
 
     echo
     info "Revert complete."
