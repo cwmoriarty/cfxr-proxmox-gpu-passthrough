@@ -7,10 +7,12 @@ set -uo pipefail
 # https://github.com/ColfaxResearch/cfxr-proxmox-gpu-passthrough
 # =============================================================================
 
+PATH="$PATH:/usr/sbin:/sbin"
+
 VFIO_CONF="/etc/modprobe.d/vfio.conf"
 GRUB_CONF="/etc/default/grub"
+KERNEL_CMDLINE="/etc/kernel/cmdline"
 MODULES_CONF="/etc/modules"
-BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -50,8 +52,9 @@ confirm() {
 backup_file() {
     local f="$1"
     if [[ -f "$f" ]]; then
-        cp "$f" "${f}${BACKUP_SUFFIX}"
-        info "Backed up $f -> ${f}${BACKUP_SUFFIX}"
+        local backup="${f}.bak.$(date +%Y%m%d%H%M%S)"
+        cp "$f" "$backup"
+        info "Backed up $f -> $backup"
     fi
 }
 
@@ -61,12 +64,34 @@ ensure_vfio_conf() {
     fi
 }
 
-# --- Idempotent helpers for GRUB iommu params ---
-grub_add_param() {
+# --- Detect whether Proxmox uses systemd-boot (/etc/kernel/cmdline) or GRUB ---
+is_systemd_boot() {
+    [[ -f "$KERNEL_CMDLINE" ]] && command -v proxmox-boot-tool &>/dev/null && [[ -d /etc/kernel/pve-efiboot-uuids || -f /etc/kernel/proxmox-boot-uuids ]]
+}
+
+# --- Idempotent helpers for kernel cmdline iommu params ---
+cmdline_add_param() {
     local param="$1"
-    if grep -q "GRUB_CMDLINE_LINUX_DEFAULT=" "$GRUB_CONF"; then
-        if ! grep -q "$param" "$GRUB_CONF"; then
-            sed -i "s/\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)/\1 ${param}/" "$GRUB_CONF"
+    if is_systemd_boot; then
+        if ! grep -qw "$param" "$KERNEL_CMDLINE"; then
+            sed -i "1s/[[:space:]]*$/ ${param}/; 1s/^[[:space:]]*//" "$KERNEL_CMDLINE"
+            info "Added '$param' to $KERNEL_CMDLINE."
+        else
+            warn "'$param' already present in $KERNEL_CMDLINE."
+        fi
+        return 0
+    fi
+
+    local line
+    line=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_CONF" || true)
+    if [[ -n "$line" ]]; then
+        if ! echo "$line" | grep -qw "$param"; then
+            # Append param inside quotes, avoiding a leading space if empty
+            if echo "$line" | grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=""'; then
+                sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\"/GRUB_CMDLINE_LINUX_DEFAULT=\"${param}\"/" "$GRUB_CONF"
+            else
+                sed -i "s/^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${param}\"/" "$GRUB_CONF"
+            fi
             info "Added '$param' to GRUB cmdline."
         else
             warn "'$param' already present in GRUB cmdline."
@@ -77,11 +102,33 @@ grub_add_param() {
     fi
 }
 
-grub_remove_param() {
+cmdline_remove_param() {
     local param="$1"
-    if grep -q "$param" "$GRUB_CONF"; then
-        sed -i "s/ ${param}//" "$GRUB_CONF"
+    if is_systemd_boot; then
+        if grep -qw "$param" "$KERNEL_CMDLINE"; then
+            sed -i -E "s/(^|[[:space:]])${param}([[:space:]]|$)/\1/g; s/^[[:space:]]+//; s/[[:space:]]+$//" "$KERNEL_CMDLINE"
+            info "Removed '$param' from $KERNEL_CMDLINE."
+        fi
+        return 0
+    fi
+
+    local line
+    line=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_CONF" || true)
+    if [[ -n "$line" ]] && echo "$line" | grep -qw "$param"; then
+        sed -i -E "/^GRUB_CMDLINE_LINUX_DEFAULT=/ { s/\"${param} /\"/; s/ ${param}\"/\"/; s/\"${param}\"/\"\"/; s/ ${param} / /g; }" "$GRUB_CONF"
         info "Removed '$param' from GRUB cmdline."
+    fi
+}
+
+update_bootloader() {
+    if is_systemd_boot; then
+        info "Refreshing Proxmox boot tool..."
+        proxmox-boot-tool refresh
+    elif command -v update-grub &>/dev/null; then
+        info "Updating GRUB..."
+        update-grub
+    else
+        warn "Neither update-grub nor proxmox-boot-tool found; update bootloader manually."
     fi
 }
 
@@ -163,25 +210,30 @@ enable_passthrough() {
     header "Enabling GPU Passthrough"
 
     require_root
-    require_cmd lscpu lspci sed || return
+    require_cmd lscpu lspci sed update-initramfs || return
 
-    if ! confirm "This will modify GRUB, kernel modules, and modprobe configs. Continue?"; then
+    if ! confirm "This will modify bootloader, kernel modules, and modprobe configs. Continue?"; then
         warn "Aborted."
         return
     fi
 
-    # --- GRUB IOMMU params ---
-    backup_file "$GRUB_CONF"
-
-    if lscpu | grep -q Intel; then
-        grub_add_param "intel_iommu=on"
-    elif lscpu | grep -q AMD; then
-        grub_add_param "amd_iommu=on"
+    # --- Bootloader IOMMU params ---
+    if is_systemd_boot; then
+        backup_file "$KERNEL_CMDLINE"
+    else
+        backup_file "$GRUB_CONF"
     fi
-    grub_add_param "iommu=pt"
 
-    info "Updating GRUB..."
-    /usr/sbin/update-grub
+    local cpu_info
+    cpu_info=$(lscpu)
+    if echo "$cpu_info" | grep -qi Intel; then
+        cmdline_add_param "intel_iommu=on"
+    elif echo "$cpu_info" | grep -qi AMD; then
+        cmdline_add_param "amd_iommu=on"
+    fi
+    cmdline_add_param "iommu=pt"
+
+    update_bootloader
 
     # --- Kernel modules ---
     backup_file "$MODULES_CONF"
@@ -197,22 +249,25 @@ enable_passthrough() {
     info "VFIO kernel modules configured in $MODULES_CONF."
 
     # --- Detect GPU PCI IDs ---
-    ensure_vfio_conf
     backup_file "$VFIO_CONF"
+    ensure_vfio_conf
 
     local lspci_output
     lspci_output=$(lspci -nn)
 
+    local gpu_lines
+    gpu_lines=$(echo "$lspci_output" | grep -Ei "vga|3d|display|audio" | grep -i -e 'nvidia' -e 'AMD/ATI' || true)
+
     local device_ids
-    device_ids=$(echo "$lspci_output" | grep -Ei "vga|3d|display|audio" \
-        | grep -i -e 'nvidia' -e 'AMD/ATI' \
-        | sed -n 's/.*\[\([0-9a-fA-F]*:[0-9a-fA-F]*\)\].*/\1/p' \
+    device_ids=$(echo "$gpu_lines" \
+        | sed -n 's/.*\[\([0-9a-fA-F]\{4\}:[0-9a-fA-F]\{4\}\)\].*/\1/p' \
+        | sort -u \
         | paste -sd ',' -)
 
     if [[ -n "$device_ids" ]]; then
         info "Found GPU PCI IDs: $device_ids"
         echo
-        echo "$lspci_output" | grep -Ei 'vga|3d|display|audio' | grep -i -e 'nvidia' -e 'AMD/ATI'
+        echo "$gpu_lines"
         echo
 
         # Set VFIO PCI IDs (idempotent)
@@ -224,7 +279,7 @@ enable_passthrough() {
     fi
 
     # --- NVIDIA softdeps ---
-    if echo "$lspci_output" | grep -Ei "vga|3d|display|audio" | grep -qi 'nvidia'; then
+    if echo "$gpu_lines" | grep -qi 'nvidia'; then
         info "NVIDIA GPU detected — adding driver softdeps."
         for drv in nouveau nvidia nvidiafb nvidia_drm drm; do
             remove_softdep "$drv"
@@ -233,7 +288,7 @@ enable_passthrough() {
     fi
 
     # --- AMD/ATI softdeps ---
-    if echo "$lspci_output" | grep -Ei "vga|3d|display|audio" | grep -qi 'AMD/ATI'; then
+    if echo "$gpu_lines" | grep -qi 'AMD/ATI'; then
         info "AMD/ATI GPU detected — adding driver softdeps."
         for drv in radeon amdgpu snd_hda_intel; do
             remove_softdep "$drv"
@@ -243,7 +298,7 @@ enable_passthrough() {
 
     # --- Update initramfs ---
     info "Updating initramfs..."
-    /usr/sbin/update-initramfs -u
+    update-initramfs -u
 
     echo
     info "Configuration complete. Review $VFIO_CONF:"
@@ -262,15 +317,23 @@ verify_passthrough() {
 
     require_cmd lspci || return
 
-    if lspci -nnk 2>/dev/null | grep -A2 -e NVIDIA -e 'AMD/ATI' | grep -q 'vfio-pci'; then
+    local gpu_bindings
+    gpu_bindings=$(lspci -nnk 2>/dev/null | grep -A3 -Ei 'NVIDIA|AMD/ATI' || true)
+
+    if [[ -z "$gpu_bindings" ]]; then
+        warn "No NVIDIA or AMD/ATI GPUs found in lspci output."
+        return
+    fi
+
+    if echo "$gpu_bindings" | grep -q 'vfio-pci'; then
         info "GPU passthrough is active — vfio-pci driver is bound:"
         echo
-        lspci -nnk 2>/dev/null | grep -A2 -e NVIDIA -e 'AMD/ATI'
+        echo "$gpu_bindings"
     else
         error "vfio-pci driver is NOT bound to the GPU(s)."
         echo
         echo "Current GPU driver bindings:"
-        lspci -nnk 2>/dev/null | grep -A2 -e NVIDIA -e 'AMD/ATI'
+        echo "$gpu_bindings"
         echo
         warn "Ensure softdep entries exist in $VFIO_CONF and reboot."
     fi
@@ -429,12 +492,14 @@ VBIOS_EOF
     popd > /dev/null
 
     # Install each extracted VBIOS
+    mkdir -p /usr/share/kvm
     local count=0
     for bin in "${tmpdir}"/vbios_*.bin; do
         [[ -f "$bin" ]] || continue
         local basename
         basename=$(basename "$bin")
         local dest="/usr/share/kvm/${basename}"
+        backup_file "$dest"
         cp "$bin" "$dest"
         info "Installed: $dest"
         count=$((count + 1))
@@ -460,21 +525,24 @@ revert_changes() {
     header "Reverting GPU Passthrough Configuration"
 
     require_root
-    require_cmd sed || return
+    require_cmd sed update-initramfs || return
 
-    if ! confirm "This will revert GRUB, kernel modules, and modprobe configs. Continue?"; then
+    if ! confirm "This will revert bootloader, kernel modules, and modprobe configs. Continue?"; then
         warn "Aborted."
         return
     fi
 
-    # --- Revert GRUB cmdline params ---
-    backup_file "$GRUB_CONF"
-    grub_remove_param "iommu=pt"
-    grub_remove_param "intel_iommu=on"
-    grub_remove_param "amd_iommu=on"
+    # --- Revert bootloader cmdline params ---
+    if is_systemd_boot; then
+        backup_file "$KERNEL_CMDLINE"
+    else
+        backup_file "$GRUB_CONF"
+    fi
+    cmdline_remove_param "iommu=pt"
+    cmdline_remove_param "intel_iommu=on"
+    cmdline_remove_param "amd_iommu=on"
 
-    info "Updating GRUB..."
-    /usr/sbin/update-grub
+    update_bootloader
 
     # --- Revert kernel modules ---
     backup_file "$MODULES_CONF"
@@ -504,7 +572,7 @@ revert_changes() {
 
     # --- Update initramfs ---
     info "Updating initramfs..."
-    /usr/sbin/update-initramfs -u
+    update-initramfs -u
 
     echo
     info "Revert complete."
@@ -531,7 +599,11 @@ EOF
 main() {
     while true; do
         show_menu
-        read -r -p "Option: " option
+        if ! read -r -p "Option: " option; then
+            echo
+            info "Exiting."
+            break
+        fi
 
         case "$option" in
             1)
